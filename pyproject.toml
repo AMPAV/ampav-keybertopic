@@ -1,0 +1,31 @@
+[project]
+name = "ampav-keybert"
+version = "0.0.1"
+description = "KeyBERT tooling for the AMPAV environment"
+readme = "README.md"
+license = "Apache-2.0"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+]
+authors = [
+    {name = "Ying Feng", email = "yingfeng@iu.edu"},
+]
+
+requires-python = ">=3.12"
+dependencies = [
+    "ampav-core>=0.0.20",
+]
+
+[project.urls]
+Homepage = "https://github.com/AMPAV/ampav-keybert"
+Repository = "https://github.com/AMPAV/ampav-keybert.git"
+Issues = "https://github.com/AMPAV/ampav-keybert/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ampav*"]
+namespaces = true
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
