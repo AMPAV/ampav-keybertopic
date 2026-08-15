@@ -1,7 +1,7 @@
-# ampav-keybert
+# ampav-keybertopic
 
-Synchronous KeyBERT keyword and keyphrase extraction tooling for the AMPAV
-environment.
+Synchronous KeyBERT keyphrase extraction and BERTopic topic modeling tooling
+for the AMPAV environment.
 
 The public extraction API is under development.
 
