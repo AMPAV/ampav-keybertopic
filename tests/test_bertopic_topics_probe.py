@@ -10,8 +10,8 @@ import unittest
 import numpy as np
 
 
-PROBE_PATH = Path(__file__).parents[1] / "experiments" / "bertopic.py"
-SPEC = importlib.util.spec_from_file_location("bertopic_probe", PROBE_PATH)
+PROBE_PATH = Path(__file__).parents[1] / "experiments" / "bertopic_topics.py"
+SPEC = importlib.util.spec_from_file_location("bertopic_topics", PROBE_PATH)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"could not load probe module from {PROBE_PATH}")
 PROBE = importlib.util.module_from_spec(SPEC)
