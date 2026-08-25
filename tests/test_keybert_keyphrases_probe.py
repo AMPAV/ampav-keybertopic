@@ -9,8 +9,8 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-PROBE_PATH = Path(__file__).parents[1] / "examples" / "keybert_keyphrases_phase1.py"
-SPEC = importlib.util.spec_from_file_location("keybert_keyphrases_phase1", PROBE_PATH)
+PROBE_PATH = Path(__file__).parents[1] / "experiments" / "keybert_keyphrases.py"
+SPEC = importlib.util.spec_from_file_location("keybert_keyphrases", PROBE_PATH)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"could not load probe module from {PROBE_PATH}")
 PROBE = importlib.util.module_from_spec(SPEC)
@@ -22,6 +22,7 @@ _build_boundary_source = PROBE._build_boundary_source
 _build_manifest = PROBE._build_manifest
 _contains_subsequence = PROBE._contains_subsequence
 _parse_fixture_spec = PROBE._parse_fixture_spec
+_quality_configurations = PROBE._quality_configurations
 _raw_token_ids = PROBE._raw_token_ids
 _validate_new_output_dir = PROBE._validate_new_output_dir
 _write_json = PROBE._write_json
@@ -63,7 +64,7 @@ class FakeSentenceModel:
         return 384
 
 
-class KeyBertPhase1ProbeTest(unittest.TestCase):
+class KeyBertProbeTest(unittest.TestCase):
     """Protect deterministic helpers and retained-output behavior."""
 
     def test_boundary_source_has_exact_token_count_and_sentinels(self) -> None:
@@ -92,6 +93,20 @@ class KeyBertPhase1ProbeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(FileExistsError):
                 _validate_new_output_dir(Path(directory))
+
+    def test_quality_matrix_includes_mmr_without_stop_words(self) -> None:
+        configurations = dict(_quality_configurations())
+
+        self.assertEqual(
+            configurations["phrase_mmr_no_stop_words"],
+            {
+                "keyphrase_ngram_range": (1, 4),
+                "stop_words": None,
+                "top_n": 10,
+                "use_mmr": True,
+                "diversity": 0.5,
+            },
+        )
 
     def test_native_tuple_order_serializes_as_json_arrays(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

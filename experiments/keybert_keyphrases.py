@@ -392,6 +392,16 @@ def _quality_configurations() -> list[tuple[str, dict[str, Any]]]:
                 "diversity": 0.5,
             },
         ),
+        (
+            "phrase_mmr_no_stop_words",
+            {
+                "keyphrase_ngram_range": (1, 4),
+                "stop_words": None,
+                "top_n": 10,
+                "use_mmr": True,
+                "diversity": 0.5,
+            },
+        ),
     ]
 
 
