@@ -717,6 +717,75 @@ def _expected_theme_counts(
     }
 
 
+def _similarity_summary(values: Sequence[float]) -> dict[str, float | int | None]:
+    """Summarize diagnostic cosine values without treating them as accuracy."""
+    if not values:
+        return {"pair_count": 0, "mean": None, "minimum": None, "maximum": None}
+    return {
+        "pair_count": len(values),
+        "mean": float(np.mean(values)),
+        "minimum": float(np.min(values)),
+        "maximum": float(np.max(values)),
+    }
+
+
+def _pooled_embedding_similarity_diagnostics(
+    documents: Sequence[dict[str, Any]], embeddings: np.ndarray
+) -> dict[str, Any]:
+    """Compare fixture-theme cosine geometry before UMAP or HDBSCAN.
+
+    The summaries diagnose the proposed pooled vectors only. Fixture themes are
+    hand-constructed probe annotations, not model labels or an accuracy score.
+    """
+    if embeddings.ndim != 2 or embeddings.shape[0] != len(documents):
+        raise ValueError("embeddings must contain one vector per document")
+    norms = np.linalg.norm(embeddings, axis=1)
+    if np.any(norms == 0.0):
+        raise ValueError("embeddings must not contain a zero vector")
+    normalized = embeddings / norms[:, np.newaxis]
+    similarities = normalized @ normalized.T
+    by_theme: dict[str, list[int]] = {}
+    for index, document in enumerate(documents):
+        theme = document.get("expected_theme")
+        if theme is not None:
+            by_theme.setdefault(str(theme), []).append(index)
+
+    within: dict[str, list[float]] = {}
+    between: dict[str, list[float]] = {}
+    themes = sorted(by_theme)
+    for left_index, left_theme in enumerate(themes):
+        within[left_theme] = [
+            float(similarities[first, second])
+            for first_offset, first in enumerate(by_theme[left_theme])
+            for second in by_theme[left_theme][first_offset + 1 :]
+        ]
+        for right_theme in themes[left_index + 1 :]:
+            key = f"{left_theme}__{right_theme}"
+            between[key] = [
+                float(similarities[first, second])
+                for first in by_theme[left_theme]
+                for second in by_theme[right_theme]
+            ]
+    all_within = [value for values in within.values() for value in values]
+    all_between = [value for values in between.values() for value in values]
+    return {
+        "semantics": (
+            "Cosine similarity of the proposed pooled document embeddings before "
+            "native UMAP and HDBSCAN; fixture themes are diagnostic annotations, "
+            "not labels or calibrated quality."
+        ),
+        "all_within_theme_pairs": _similarity_summary(all_within),
+        "all_between_theme_pairs": _similarity_summary(all_between),
+        "within_theme": {
+            theme: _similarity_summary(values) for theme, values in sorted(within.items())
+        },
+        "between_theme": {
+            themes: _similarity_summary(values)
+            for themes, values in sorted(between.items())
+        },
+    }
+
+
 def _run_topics(
     args: argparse.Namespace,
     sentence_model: Any,
@@ -738,7 +807,7 @@ def _run_topics(
 def _run_pooled_topics(
     args: argparse.Namespace,
     sentence_model: Any,
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str], np.ndarray]:
     """Run BERTopic with one pooled chunk embedding per source document."""
     if args.min_topic_size < 2:
         raise ValueError("min-topic-size must be at least 2")
@@ -756,7 +825,10 @@ def _run_pooled_topics(
         embeddings=embeddings,
         embedding_diagnostics=diagnostics,
     )
-    return native_output, documents, input_refs
+    native_output["pooled_embedding_similarity_diagnostics"] = (
+        _pooled_embedding_similarity_diagnostics(documents, embeddings)
+    )
+    return native_output, documents, input_refs, embeddings
 
 
 def _fit_topic_documents(
@@ -974,6 +1046,7 @@ def _write_run(
     input_refs: list[str],
     generated_boundary_inputs: dict[str, str] | None = None,
     documents: list[dict[str, Any]] | None = None,
+    pooled_embeddings: np.ndarray | None = None,
 ) -> None:
     """Persist one human-reviewable native run record."""
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -996,6 +1069,21 @@ def _write_run(
     )
     if documents is not None:
         _write_json(output_dir / "documents.json", documents)
+    if pooled_embeddings is not None:
+        if documents is None or pooled_embeddings.shape[0] != len(documents):
+            raise ValueError("pooled embeddings must align with retained documents")
+        _write_json(
+            output_dir / "pooled_embeddings.json",
+            {
+                "document_ids": [document["id"] for document in documents],
+                "shape": list(pooled_embeddings.shape),
+                "values": pooled_embeddings,
+                "semantics": (
+                    "Token-count-weighted chunk mean after final L2 normalization; "
+                    "not an embedding of the original full document."
+                ),
+            },
+        )
     if generated_boundary_inputs:
         inputs_dir = output_dir / "inputs"
         inputs_dir.mkdir()
@@ -1017,12 +1105,16 @@ def main() -> None:
     if args.probe == "boundary":
         native_output, generated_inputs, input_refs = _run_boundary(sentence_model)
         documents = None
+        pooled_embeddings = None
     elif args.probe == "pooled-topics":
-        native_output, documents, input_refs = _run_pooled_topics(args, sentence_model)
+        native_output, documents, input_refs, pooled_embeddings = _run_pooled_topics(
+            args, sentence_model
+        )
         generated_inputs = None
     else:
         native_output, documents, input_refs = _run_topics(args, sentence_model)
         generated_inputs = None
+        pooled_embeddings = None
 
     completed_at = datetime.now().astimezone()
     manifest = _build_manifest(
@@ -1040,6 +1132,7 @@ def main() -> None:
         input_refs=input_refs,
         generated_boundary_inputs=generated_inputs,
         documents=documents,
+        pooled_embeddings=pooled_embeddings,
     )
     print(json.dumps({"output_dir": str(args.output_dir), "manifest": manifest}, indent=2))
 

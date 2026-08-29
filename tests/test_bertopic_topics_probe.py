@@ -189,6 +189,28 @@ class BertopicProbeTest(unittest.TestCase):
             "token_count_weighted_mean_then_l2_normalize",
         )
 
+    def test_pooled_embedding_similarity_diagnostics_separate_pair_groups(self) -> None:
+        documents = [
+            {"expected_theme": "archive"},
+            {"expected_theme": "archive"},
+            {"expected_theme": "racing"},
+            {"expected_theme": "racing"},
+        ]
+        embeddings = np.asarray(
+            [[1.0, 0.0], [0.8, 0.6], [0.0, 1.0], [0.6, 0.8]]
+        )
+
+        diagnostics = PROBE._pooled_embedding_similarity_diagnostics(
+            documents, embeddings
+        )
+
+        self.assertEqual(diagnostics["all_within_theme_pairs"]["pair_count"], 2)
+        self.assertAlmostEqual(diagnostics["all_within_theme_pairs"]["mean"], 0.8)
+        self.assertEqual(diagnostics["all_between_theme_pairs"]["pair_count"], 4)
+        self.assertAlmostEqual(
+            diagnostics["between_theme"]["archive__racing"]["mean"], 0.54
+        )
+
 
 class _FakeTokenizer:
     """Small whitespace tokenizer for model-free chunking tests."""
