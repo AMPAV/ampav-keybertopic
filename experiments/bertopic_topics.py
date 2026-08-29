@@ -54,16 +54,47 @@ def parse_args() -> argparse.Namespace:
         "topics",
         help="fit native BERTopic to a caller-built document collection",
     )
-    topics.add_argument("output_dir", type=Path, help="new retained-run directory")
-    topics.add_argument("--fixture-id", required=True)
-    topics.add_argument(
+    _add_topic_arguments(topics)
+
+    pooled_topics = subparsers.add_parser(
+        "pooled-topics",
+        help="fit BERTopic with one token-weighted pooled chunk embedding per document",
+    )
+    _add_topic_arguments(pooled_topics)
+    pooled_topics.set_defaults(task="AMPAV-157")
+    pooled_topics.add_argument(
+        "--chunk-max-tokens",
+        type=int,
+        default=256,
+        help="maximum tokenizer tokens including special tokens per embedding chunk",
+    )
+    pooled_topics.add_argument(
+        "--chunk-overlap-sentences",
+        type=int,
+        default=0,
+        help="sentence overlap between adjacent embedding chunks (default: 0)",
+    )
+
+    return parser.parse_args()
+
+
+def _add_topic_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add arguments shared by native and pooled corpus-topic probes."""
+    parser.add_argument("output_dir", type=Path, help="new retained-run directory")
+    parser.add_argument("--fixture-id", required=True)
+    parser.add_argument(
+        "--task",
+        default="AMPAV-146",
+        help="Jira task owning this retained probe (default: AMPAV-146)",
+    )
+    parser.add_argument(
         "--corpus-json",
         action="append",
         default=[],
         type=Path,
         help="JSON list of objects containing id, text, and optional expected_theme",
     )
-    topics.add_argument(
+    parser.add_argument(
         "--text",
         action="append",
         default=[],
@@ -71,7 +102,7 @@ def parse_args() -> argparse.Namespace:
         metavar="ID=PATH",
         help="add one UTF-8 file as one document",
     )
-    topics.add_argument(
+    parser.add_argument(
         "--chunked-text",
         action="append",
         default=[],
@@ -79,29 +110,29 @@ def parse_args() -> argparse.Namespace:
         metavar="ID=PATH",
         help="add sentence-aligned probe documents derived from one UTF-8 file",
     )
-    topics.add_argument(
+    parser.add_argument(
         "--max-words-per-document",
         type=int,
         default=180,
         help="probe-only word cap used for --chunked-text (default: 180)",
     )
-    topics.add_argument("--min-topic-size", type=int, default=10)
-    topics.add_argument(
+    parser.add_argument("--min-topic-size", type=int, default=10)
+    parser.add_argument(
         "--random-state",
         type=int,
         help="construct an explicit UMAP with this random state",
     )
-    topics.add_argument(
+    parser.add_argument(
         "--calculate-probabilities",
         action="store_true",
         help="request full native HDBSCAN probability distributions",
     )
-    topics.add_argument(
+    parser.add_argument(
         "--representation-stop-words",
         choices=("english",),
         help="optional native CountVectorizer stop-word setting",
     )
-    topics.add_argument(
+    parser.add_argument(
         "--representation-ngram-range",
         nargs=2,
         default=(1, 1),
@@ -109,15 +140,13 @@ def parse_args() -> argparse.Namespace:
         metavar=("MIN", "MAX"),
         help="native CountVectorizer n-gram range (default: 1 1)",
     )
-    topics.add_argument(
+    parser.add_argument(
         "--representation-min-df",
         type=int,
         default=1,
         help="native CountVectorizer minimum document frequency (default: 1)",
     )
-    _add_model_arguments(topics)
-
-    return parser.parse_args()
+    _add_model_arguments(parser)
 
 
 def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
@@ -468,6 +497,147 @@ def _measure_document_tokens(sentence_model: Any, text: str) -> dict[str, Any]:
     }
 
 
+def _split_overlong_sentence(
+    tokenizer: Any, sentence: str, max_tokens: int
+) -> list[str]:
+    """Split one overlong sentence into token-bounded word units for a probe."""
+    words = sentence.split()
+    units: list[str] = []
+    current: list[str] = []
+    for word in words:
+        candidate = " ".join([*current, word])
+        if len(_raw_token_ids(tokenizer, candidate)) <= max_tokens:
+            current.append(word)
+            continue
+        if not current:
+            raise ValueError(
+                "one whitespace-delimited word exceeds the requested chunk token limit"
+            )
+        units.append(" ".join(current))
+        current = [word]
+    if current:
+        units.append(" ".join(current))
+    return units
+
+
+def _embedding_chunks(
+    sentence_model: Any,
+    text: str,
+    *,
+    max_tokens: int,
+    overlap_sentences: int,
+) -> list[str]:
+    """Build sentence-first chunks that each fit the embedding model exactly.
+
+    A sentence longer than the requested boundary falls back to bounded word
+    units. The chunks are experiment-side embedding inputs, never BERTopic
+    corpus documents.
+    """
+    if not isinstance(max_tokens, int) or max_tokens < 3:
+        raise ValueError("chunk-max-tokens must be at least 3")
+    if max_tokens > sentence_model.max_seq_length:
+        raise ValueError(
+            "chunk-max-tokens must not exceed the embedding model max_seq_length"
+        )
+    if not isinstance(overlap_sentences, int) or overlap_sentences < 0:
+        raise ValueError("chunk-overlap-sentences must be a non-negative integer")
+
+    tokenizer = sentence_model[0].tokenizer
+    normalized = " ".join(text.split())
+    sentences = [part.strip() for part in SENTENCE_BOUNDARY.split(normalized) if part.strip()]
+    units: list[str] = []
+    for sentence in sentences:
+        if len(_raw_token_ids(tokenizer, sentence)) <= max_tokens:
+            units.append(sentence)
+        else:
+            units.extend(_split_overlong_sentence(tokenizer, sentence, max_tokens))
+
+    chunks: list[str] = []
+    current: list[str] = []
+    for unit in units:
+        candidate = " ".join([*current, unit])
+        if len(_raw_token_ids(tokenizer, candidate)) <= max_tokens:
+            current.append(unit)
+            continue
+        if not current:
+            raise RuntimeError("a bounded embedding unit did not fit its token limit")
+        chunks.append(" ".join(current))
+        current = current[-overlap_sentences:] if overlap_sentences else []
+        while current and len(_raw_token_ids(tokenizer, " ".join([*current, unit]))) > max_tokens:
+            current.pop(0)
+        current.append(unit)
+    if current:
+        chunks.append(" ".join(current))
+    if not chunks:
+        raise ValueError("document produced no embedding chunks")
+    return chunks
+
+
+def _pooled_document_embeddings(
+    sentence_model: Any,
+    documents: Sequence[dict[str, Any]],
+    *,
+    max_tokens: int,
+    overlap_sentences: int,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Embed bounded chunks and return one normalized weighted mean per source."""
+    tokenizer = sentence_model[0].tokenizer
+    special_token_count = len(_raw_token_ids(tokenizer, ""))
+    chunks_by_document = [
+        _embedding_chunks(
+            sentence_model,
+            document["text"],
+            max_tokens=max_tokens,
+            overlap_sentences=overlap_sentences,
+        )
+        for document in documents
+    ]
+    flat_chunks = [chunk for chunks in chunks_by_document for chunk in chunks]
+    encoded, _, _ = _capture_call(
+        lambda: sentence_model.encode(
+            flat_chunks,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+    )
+    chunk_embeddings = np.asarray(encoded)
+    if chunk_embeddings.ndim != 2 or chunk_embeddings.shape[0] != len(flat_chunks):
+        raise RuntimeError("native embedding output did not contain one vector per chunk")
+
+    pooled_rows: list[np.ndarray] = []
+    diagnostics: list[dict[str, Any]] = []
+    offset = 0
+    for document, chunks in zip(documents, chunks_by_document):
+        count = len(chunks)
+        document_embeddings = chunk_embeddings[offset : offset + count]
+        offset += count
+        token_counts = [len(_raw_token_ids(tokenizer, chunk)) for chunk in chunks]
+        retained_counts = [len(_native_token_ids(sentence_model, chunk)) for chunk in chunks]
+        if token_counts != retained_counts:
+            raise RuntimeError("a pooled embedding chunk was truncated")
+        weights = np.asarray(
+            [max(1, token_count - special_token_count) for token_count in token_counts],
+            dtype=float,
+        )
+        pooled = np.average(document_embeddings, axis=0, weights=weights)
+        norm = float(np.linalg.norm(pooled))
+        if norm == 0.0:
+            raise RuntimeError(f"pooled embedding has zero norm for {document['id']}")
+        pooled_rows.append(pooled / norm)
+        diagnostics.append(
+            {
+                "id": document["id"],
+                "chunk_count": count,
+                "chunk_token_counts_including_special_tokens": token_counts,
+                "chunk_retained_tokens_including_special_tokens": retained_counts,
+                "pooling": "token_count_weighted_mean_then_l2_normalize",
+                "pooling_weights_content_tokens": weights.astype(int).tolist(),
+                "unnormalized_embedding_l2_norm": norm,
+            }
+        )
+    return np.asarray(pooled_rows), diagnostics
+
+
 def _build_topic_model(args: argparse.Namespace, sentence_model: Any, document_count: int) -> Any:
     """Construct native BERTopic with only the selected bounded configuration."""
     from bertopic import BERTopic
@@ -555,13 +725,63 @@ def _run_topics(
     if args.min_topic_size < 2:
         raise ValueError("min-topic-size must be at least 2")
     documents, input_refs = _load_topic_documents(args)
+    native_output = _fit_topic_documents(
+        args,
+        sentence_model,
+        documents,
+        embeddings=None,
+        embedding_diagnostics=None,
+    )
+    return native_output, documents, input_refs
+
+
+def _run_pooled_topics(
+    args: argparse.Namespace,
+    sentence_model: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+    """Run BERTopic with one pooled chunk embedding per source document."""
+    if args.min_topic_size < 2:
+        raise ValueError("min-topic-size must be at least 2")
+    documents, input_refs = _load_topic_documents(args)
+    embeddings, diagnostics = _pooled_document_embeddings(
+        sentence_model,
+        documents,
+        max_tokens=args.chunk_max_tokens,
+        overlap_sentences=args.chunk_overlap_sentences,
+    )
+    native_output = _fit_topic_documents(
+        args,
+        sentence_model,
+        documents,
+        embeddings=embeddings,
+        embedding_diagnostics=diagnostics,
+    )
+    return native_output, documents, input_refs
+
+
+def _fit_topic_documents(
+    args: argparse.Namespace,
+    sentence_model: Any,
+    documents: list[dict[str, Any]],
+    *,
+    embeddings: np.ndarray | None,
+    embedding_diagnostics: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Fit native BERTopic while retaining selected embedding-path evidence."""
     texts = [document["text"] for document in documents]
     token_measurements = [
         _measure_document_tokens(sentence_model, text) for text in texts
     ]
+    if embeddings is not None and embeddings.shape != (
+        len(documents),
+        sentence_model.get_embedding_dimension(),
+    ):
+        raise ValueError("pooled embedding matrix must contain one fixed-size vector per document")
     model = _build_topic_model(args, sentence_model, len(documents))
     fit_result, fit_seconds, fit_warnings = _capture_call(
-        lambda: model.fit_transform(texts)
+        lambda: model.fit_transform(texts, embeddings=embeddings)
+        if embeddings is not None
+        else model.fit_transform(texts)
     )
     topics, probabilities = fit_result
     topic_ids = [int(topic) for topic in topics]
@@ -571,23 +791,40 @@ def _run_topics(
         str(topic): _json_safe(model.get_topic(topic)) for topic in unique_topics
     }
     document_rows = []
-    for document, topic, token_measurement in zip(
-        documents, topic_ids, token_measurements
+    for index, (document, topic, token_measurement) in enumerate(
+        zip(documents, topic_ids, token_measurements)
     ):
-        document_rows.append(
-            {
-                "id": document["id"],
-                "expected_theme": document["expected_theme"],
-                "source_kind": document["source_kind"],
-                "topic": topic,
-                "token_measurement": token_measurement,
-            }
-        )
+        row = {
+            "id": document["id"],
+            "expected_theme": document["expected_theme"],
+            "source_kind": document["source_kind"],
+            "topic": topic,
+            "token_measurement": token_measurement,
+        }
+        if embedding_diagnostics is not None:
+            row["pooled_embedding_diagnostics"] = embedding_diagnostics[index]
+        document_rows.append(row)
 
-    native_output = {
-        "probe": "topics",
+    return {
+        "probe": args.probe,
         "fixture_id": args.fixture_id,
         "document_count": len(documents),
+        "embedding_strategy": (
+            "native_full_document_embedding"
+            if embeddings is None
+            else "token_count_weighted_chunk_mean_then_l2_normalize"
+        ),
+        "embedding_matrix": (
+            None
+            if embeddings is None
+            else {
+                "shape": list(embeddings.shape),
+                "dtype": str(embeddings.dtype),
+                "one_vector_per_source_document": True,
+                "chunk_max_tokens": args.chunk_max_tokens,
+                "chunk_overlap_sentences": args.chunk_overlap_sentences,
+            }
+        ),
         "fit_transform": {
             "topics": topic_ids,
             "probabilities": None if probabilities is None else probability_array.tolist(),
@@ -626,7 +863,6 @@ def _run_topics(
             ],
         },
     }
-    return native_output, documents, input_refs
 
 
 def _effective_hf_hub_cache() -> str:
@@ -651,7 +887,7 @@ def _build_manifest(
 ) -> dict[str, Any]:
     """Build structured native-version, model, and runtime metadata."""
     manifest = {
-        "task": "AMPAV-146",
+        "task": getattr(args, "task", "AMPAV-146"),
         "probe": args.probe,
         "started_at": started_at.isoformat(),
         "completed_at": completed_at.isoformat(),
@@ -684,7 +920,7 @@ def _build_manifest(
         "model_load_seconds": round(model_load_seconds, 6),
         "model_load_warnings": model_load_warnings,
     }
-    if args.probe == "topics":
+    if args.probe in {"topics", "pooled-topics"}:
         manifest.update(
             {
                 "fixture_id": args.fixture_id,
@@ -699,6 +935,14 @@ def _build_manifest(
                     ),
                     "representation_min_df": args.representation_min_df,
                 },
+            }
+        )
+    if args.probe == "pooled-topics":
+        manifest["effective_parameters"].update(
+            {
+                "chunk_max_tokens": args.chunk_max_tokens,
+                "chunk_overlap_sentences": args.chunk_overlap_sentences,
+                "pooling": "token_count_weighted_mean_then_l2_normalize",
             }
         )
     return manifest
@@ -773,6 +1017,9 @@ def main() -> None:
     if args.probe == "boundary":
         native_output, generated_inputs, input_refs = _run_boundary(sentence_model)
         documents = None
+    elif args.probe == "pooled-topics":
+        native_output, documents, input_refs = _run_pooled_topics(args, sentence_model)
+        generated_inputs = None
     else:
         native_output, documents, input_refs = _run_topics(args, sentence_model)
         generated_inputs = None
